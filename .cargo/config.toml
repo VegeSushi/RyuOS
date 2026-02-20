@@ -1,0 +1,13 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+runner = "elf2uf2-rs -d"
+
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "no-vectorize-loops",
+    # Vital for fixing those AtomicUsize / fetch_add errors
+    "--cfg", "portable_atomic_global_cas",
+]

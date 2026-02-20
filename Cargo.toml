@@ -1,0 +1,26 @@
+[package]
+name = "ryu-os"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The core HAL with critical-section-impl to handle atomics
+rp2040-hal = { version = "0.10.2", features = ["rt", "critical-section-impl"] }
+rp2040-boot2 = "0.3.0"
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+embedded-hal = "1.0.0"
+fugit = "0.3.7"
+panic-halt = "0.2.0"
+
+# Required for atomics on the M0+
+portable-atomic = { version = "1.7.0", features = ["critical-section"] }
+critical-section = "1.2.0"
+
+# Optional but recommended for printing
+defmt = "0.3"
+defmt-rtt = "0.4.0"
+panic-probe = { version = "0.3.1", features = ["print-defmt"] }
+
+[lints.clippy]
+too_long_first_doc_paragraph = "allow"
