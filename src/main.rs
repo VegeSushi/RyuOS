@@ -3,6 +3,9 @@
 
 extern crate alloc;
 
+mod pins;
+
+use crate::pins::PinList;
 use embedded_alloc::TlsfHeap as Heap;
 use panic_halt as _;
 use rp2040_hal as hal;
@@ -12,6 +15,7 @@ use usbd_serial::SerialPort;
 use core::str;
 use hal::rom_data;
 use alloc::string::String;
+use embedded_hal::digital::{OutputPin};
 use wartcl::{empty, Env, FlowChange};
 
 #[global_allocator]
@@ -20,6 +24,8 @@ static ALLOCATOR: Heap = Heap::empty();
 static mut SCRIPT_BUFFER: Option<String> = None;
 static mut IN_EDITOR: bool = false;
 static mut CURSOR_POS: usize = 0;
+
+static mut PINS: Option<PinList> = None;
 
 #[link_section = ".boot2"]
 #[used]
@@ -42,6 +48,13 @@ fn main() -> ! {
 
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+
+    let sio = hal::Sio::new(pac.SIO);
+    let pins = hal::gpio::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
+
+    unsafe {
+        PINS = Some(PinList::new(pins));
+    }
 
     let clocks = hal::clocks::init_clocks_and_plls(
         12_000_000u32,
@@ -396,7 +409,33 @@ fn run_tcl(serial: &mut SerialPort<hal::usb::UsbBus>, code: &str) {
         Ok(empty())
     });
 
-    
+    tcl.register(b"gpio", 0, |_, args| {
+        if args.len() >= 3 {
+            let pin_idx_str = core::str::from_utf8(&args[1]).map_err(|_| FlowChange::Error)?;
+            let action = core::str::from_utf8(&args[2]).map_err(|_| FlowChange::Error)?;
+            
+            if let Ok(idx) = pin_idx_str.parse::<usize>() {
+                unsafe {
+                    if let Some(ref mut pin_list) = crate::PINS {
+                        if idx < pin_list.pins.len() {
+                            let pin = &mut pin_list.pins[idx];
+
+                            match action {
+                                "high" | "1" => {
+                                    let _ = pin.set_high();
+                                }
+                                "low" | "0" => {
+                                    let _ = pin.set_low();
+                                }
+                                _ => return Err(FlowChange::Error),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(empty())
+    });
 
     tcl.register(b"put", 0, |_, args| {
         if let Some(arg) = args.get(1) {
