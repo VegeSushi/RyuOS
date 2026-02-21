@@ -378,16 +378,31 @@ fn handle_command(serial: &mut SerialPort<hal::usb::UsbBus>, line: &str) {
 fn run_tcl(serial: &mut SerialPort<hal::usb::UsbBus>, code: &str) {
     let mut tcl = Env::default();
 
-    // The closure arguments are |environment, arguments|
-    // args[0] is the command name ("puts")
-    // args[1] is the first argument
-    tcl.register(b"puts", 0, |_env, args| {
-        if args.len() > 1 {
-            // Return the string so the caller can print it
-            Ok(args[1].clone()) 
-        } else {
-            Ok(empty())
+    // Command: sleep <ms>
+    tcl.register(b"sleep", 0, |_, args| {
+        if let Some(arg) = args.get(1) {
+            if let Ok(ms_str) = core::str::from_utf8(arg) {
+                if let Ok(ms) = ms_str.parse::<u64>() {
+                    // Accessing the timer registers via method calls
+                    let timer = unsafe { &*pac::TIMER::ptr() };
+                    let start = timer.timelr().read().bits();
+                    let target = ms as u32 * 1000;
+                    while timer.timelr().read().bits().wrapping_sub(start) < target {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
         }
+        Ok(empty())
+    });
+
+    
+
+    tcl.register(b"put", 0, |_, args| {
+        if let Some(arg) = args.get(1) {
+            return Ok(arg.to_vec().into()); 
+        }
+        Ok(empty())
     });
 
     match tcl.eval(code.as_bytes()) {
@@ -397,16 +412,12 @@ fn run_tcl(serial: &mut SerialPort<hal::usb::UsbBus>, code: &str) {
                 let _ = serial.write(b"\r\n");
             }
         }
-        Err(FlowChange::Error) => {
-            let _ = serial.write(b"Tcl Error\r\n");
-        }
+        Err(FlowChange::Error) => { let _ = serial.write(b"Tcl Error\r\n"); }
         Err(FlowChange::Return(val)) => {
-            let _ = serial.write(b"Script returned: ");
+            let _ = serial.write(b"Returned: ");
             let _ = serial.write(String::from_utf8_lossy(&val).as_bytes());
             let _ = serial.write(b"\r\n");
         }
-        Err(_) => {
-            let _ = serial.write(b"Unexpected flow change\r\n");
-        }
+        Err(_) => { let _ = serial.write(b"Unexpected flow change\r\n"); }
     }
 }
