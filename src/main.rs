@@ -12,6 +12,7 @@ use usbd_serial::SerialPort;
 use core::str;
 use hal::rom_data;
 use alloc::string::String;
+use wartcl::{empty, Env, FlowChange};
 
 #[global_allocator]
 static ALLOCATOR: Heap = Heap::empty();
@@ -358,7 +359,9 @@ fn handle_command(serial: &mut SerialPort<hal::usb::UsbBus>, line: &str) {
             "run" => unsafe {
                 let script_ptr = core::ptr::addr_of!(SCRIPT_BUFFER);
                 if let Some(ref code) = *script_ptr {
-                    
+                    let _ = serial.write(b"--- Executing Tcl ---\r\n");
+                    run_tcl(serial, code);
+                    let _ = serial.write(b"\r\n--- Done ---\r\n");
                 } else {
                     let _ = serial.write(b"Buffer empty. Use 'edit' first.\r\n");
                 }
@@ -372,3 +375,38 @@ fn handle_command(serial: &mut SerialPort<hal::usb::UsbBus>, line: &str) {
     }
 }
 
+fn run_tcl(serial: &mut SerialPort<hal::usb::UsbBus>, code: &str) {
+    let mut tcl = Env::default();
+
+    // The closure arguments are |environment, arguments|
+    // args[0] is the command name ("puts")
+    // args[1] is the first argument
+    tcl.register(b"puts", 0, |_env, args| {
+        if args.len() > 1 {
+            // Return the string so the caller can print it
+            Ok(args[1].clone()) 
+        } else {
+            Ok(empty())
+        }
+    });
+
+    match tcl.eval(code.as_bytes()) {
+        Ok(result) => {
+            if !result.is_empty() {
+                let _ = serial.write(String::from_utf8_lossy(&result).as_bytes());
+                let _ = serial.write(b"\r\n");
+            }
+        }
+        Err(FlowChange::Error) => {
+            let _ = serial.write(b"Tcl Error\r\n");
+        }
+        Err(FlowChange::Return(val)) => {
+            let _ = serial.write(b"Script returned: ");
+            let _ = serial.write(String::from_utf8_lossy(&val).as_bytes());
+            let _ = serial.write(b"\r\n");
+        }
+        Err(_) => {
+            let _ = serial.write(b"Unexpected flow change\r\n");
+        }
+    }
+}
