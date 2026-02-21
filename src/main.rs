@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use embedded_alloc::TlsfHeap as Heap;
 use panic_halt as _;
 use rp2040_hal as hal;
 use hal::pac;
@@ -8,6 +11,14 @@ use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 use core::str;
 use hal::rom_data;
+use alloc::string::String;
+
+#[global_allocator]
+static ALLOCATOR: Heap = Heap::empty();
+
+static mut SCRIPT_BUFFER: Option<String> = None;
+static mut IN_EDITOR: bool = false;
+static mut CURSOR_POS: usize = 0;
 
 #[link_section = ".boot2"]
 #[used]
@@ -15,6 +26,19 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_GENERIC_03H;
 
 #[hal::entry]
 fn main() -> ! {
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 32 * 1024;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        
+        // We use addr_of_mut! to get a raw pointer without creating an intermediate reference.
+        // This satisfies the new safety requirements for mutable statics.
+        unsafe {
+            let ptr = core::ptr::addr_of_mut!(HEAP_MEM) as usize;
+            ALLOCATOR.init(ptr, HEAP_SIZE);
+        }
+    }
+
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
 
@@ -53,67 +77,171 @@ fn main() -> ! {
         .build();
 
     // --- Command Parser State ---
-    let mut input_buf = [0u8; 64];
-    let mut input_pos = 0usize;
+    let mut line_buf = [0u8; 128];
+    let mut line_pos = 0usize;
+    
+    // State machine for ANSI Escape Sequences
+    let mut esc_state = 0u8; 
 
     loop {
-        // 1. Poll USB
         if usb_dev.poll(&mut [&mut serial]) {
-            // 2. Try to read a full line
-            if let Some(command_line) = read_serial_line(&mut serial, &mut input_buf, &mut input_pos) {
-                // 3. If a line was completed, execute it
-                handle_command(&mut serial, command_line);
-                let _ = serial.write(b"> "); 
-            }
-        }
-    }
-}
-
-fn read_serial_line<'a>(
-    serial: &mut SerialPort<hal::usb::UsbBus>,
-    buf: &'a mut [u8],
-    pos: &mut usize,
-) -> Option<&'a str> {
-    let mut read_buf = [0u8; 16];
-
-    match serial.read(&mut read_buf) {
-        Ok(count) if count > 0 => {
-            for i in 0..count {
-                let c = read_buf[i];
-                match c {
-                    // Backspace / Delete
-                    8 | 127 => {
-                        if *pos > 0 {
-                            *pos -= 1;
-                            let _ = serial.write(b"\x08 \x08");
-                        }
-                    }
-                    // Newline
-                    b'\r' | b'\n' => {
-                        let _ = serial.write(b"\r\n");
-                        if *pos > 0 {
-                            let line = str::from_utf8(&buf[..*pos]).ok();
-                            *pos = 0; // Reset for next time
-                            return line;
+            let mut read_buf = [0u8; 16];
+            if let Ok(count) = serial.read(&mut read_buf) {
+                for i in 0..count {
+                    let c = read_buf[i];
+                    unsafe {
+                        if IN_EDITOR {
+                            handle_editor_input(&mut serial, c, &mut esc_state);
                         } else {
-                            // If empty enter, just show prompt again
-                            let _ = serial.write(b"> ");
-                        }
-                    }
-                    // Normal chars
-                    _ => {
-                        if *pos < buf.len() {
-                            buf[*pos] = c;
-                            *pos += 1;
-                            let _ = serial.write(&[c]);
+                            match c {
+                                b'\r' | b'\n' => {
+                                    let _ = serial.write(b"\r\n");
+                                    if line_pos > 0 {
+                                        if let Ok(line) = str::from_utf8(&line_buf[..line_pos]) {
+                                            handle_command(&mut serial, line);
+                                        }
+                                        line_pos = 0;
+                                    }
+                                    if !IN_EDITOR {
+                                        let _ = serial.write(b"> ");
+                                    }
+                                }
+                                8 | 127 => {
+                                    if line_pos > 0 {
+                                        line_pos -= 1;
+                                        let _ = serial.write(b"\x08 \x08");
+                                    }
+                                }
+                                _ => {
+                                    if line_pos < line_buf.len() {
+                                        line_buf[line_pos] = c;
+                                        line_pos += 1;
+                                        let _ = serial.write(&[c]);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        _ => {}
     }
-    None
+}
+
+unsafe fn handle_editor_input(serial: &mut SerialPort<hal::usb::UsbBus>, c: u8, esc_state: &mut u8) {
+    let script_ptr = core::ptr::addr_of_mut!(SCRIPT_BUFFER);
+    if let Some(buf) = (*script_ptr).as_mut() {
+        match *esc_state {
+            0 => { // Normal Mode
+                match c {
+                    27 => *esc_state = 1,
+                    24 => { // CTRL+X
+                        IN_EDITOR = false;
+                        let _ = serial.write(b"\r\n[ Saved ]\r\n> ");
+                    }
+                    b'\r' | b'\n' => {
+                        buf.insert(CURSOR_POS, '\n');
+                        CURSOR_POS += 1;
+                        refresh_screen(serial, buf);
+                    }
+                    8 | 127 => { // Backspace
+                        if CURSOR_POS > 0 {
+                            CURSOR_POS -= 1;
+                            buf.remove(CURSOR_POS);
+                            refresh_screen(serial, buf);
+                        }
+                    }
+                    _ => {
+                        if c >= 32 && c <= 126 {
+                            buf.insert(CURSOR_POS, c as char);
+                            CURSOR_POS += 1;
+                            refresh_screen(serial, buf);
+                        }
+                    }
+                }
+            }
+            1 => { if c == b'[' { *esc_state = 2; } else { *esc_state = 0; } }
+            2 => { // ANSI Sequence Handler
+                match c {
+                    b'A' => { // UP
+                        CURSOR_POS = find_vertical_pos(buf, CURSOR_POS, true);
+                    }
+                    b'B' => { // DOWN
+                        CURSOR_POS = find_vertical_pos(buf, CURSOR_POS, false);
+                    }
+                    b'C' => { // RIGHT
+                        if CURSOR_POS < buf.len() { CURSOR_POS += 1; }
+                    }
+                    b'D' => { // LEFT
+                        if CURSOR_POS > 0 { CURSOR_POS -= 1; }
+                    }
+                    _ => {}
+                }
+                *esc_state = 0;
+                refresh_screen(serial, buf);
+            }
+            _ => *esc_state = 0,
+        }
+    }
+}
+
+fn find_vertical_pos(buf: &str, current_pos: usize, up: bool) -> usize {
+    // 1. Find the start of the current line
+    let line_start = buf[..current_pos].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let column = current_pos - line_start;
+
+    if up {
+        if line_start == 0 { return current_pos; } // Already on top line
+        // 2. Find the start of the previous line
+        let prev_line_end = line_start - 1;
+        let prev_line_start = buf[..prev_line_end].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        let prev_line_len = prev_line_end - prev_line_start;
+        
+        // 3. Aim for the same column, but clamp to line length
+        prev_line_start + core::cmp::min(column, prev_line_len)
+    } else {
+        // 2. Find the start of the next line
+        if let Some(next_line_start) = buf[current_pos..].find('\n').map(|n| n + current_pos + 1) {
+            let remainder = &buf[next_line_start..];
+            let next_line_end = remainder.find('\n').map(|n| n + next_line_start).unwrap_or(buf.len());
+            let next_line_len = next_line_end - next_line_start;
+            
+            // 3. Aim for same column, clamp to next line length
+            next_line_start + core::cmp::min(column, next_line_len)
+        } else {
+            current_pos // Already on bottom line
+        }
+    }
+}
+
+fn refresh_screen(serial: &mut SerialPort<hal::usb::UsbBus>, buf: &str) {
+    // 1. Clear Screen and Home Cursor
+    let _ = serial.write(b"\x1b[2J\x1b[H"); 
+    let _ = serial.write(b"--- RYU EDITOR (CTRL+X to Exit) ---\r\n");
+    
+    let cursor_idx = unsafe { CURSOR_POS };
+    
+    // 2. Iterate through buffer and print char-by-char to handle cursor injection
+    // We use a small buffer to avoid excessive USB overhead
+    for (i, c) in buf.chars().enumerate() {
+        // If this is the cursor position, print a visual marker
+        if i == cursor_idx {
+            let _ = serial.write(b"\x1b[7m \x1b[0m"); // Inverted space (block cursor)
+        }
+
+        if c == '\n' {
+            let _ = serial.write(b"\r\n"); // The fix for the "broken carriage"
+        } else {
+            let mut b = [0u8; 4];
+            let s = c.encode_utf8(&mut b);
+            let _ = serial.write(s.as_bytes());
+        }
+    }
+
+    // 3. Handle case where cursor is at the very end of the buffer
+    if cursor_idx == buf.len() {
+        let _ = serial.write(b"\x1b[7m \x1b[0m");
+    }
 }
 
 /// Simple command parser that splits by whitespace
@@ -171,6 +299,43 @@ fn handle_command(serial: &mut SerialPort<hal::usb::UsbBus>, line: &str) {
                 let _ = serial.write(b"Jumping to Bootloader...\r\n");
                 rom_data::reset_to_usb_boot(0, 0);
             }
+            "edit" => unsafe {
+                IN_EDITOR = true;
+                // Get the raw pointer to the static Option
+                let script_ptr = core::ptr::addr_of_mut!(SCRIPT_BUFFER);
+    
+                // Dereference the pointer to check/modify the Option
+                if (*script_ptr).is_none() {
+                    *script_ptr = Some(String::new());
+                }
+    
+                // Now safely access the inner String
+                if let Some(ref buf) = *script_ptr {
+                    refresh_screen(serial, buf);
+                }
+            },
+            "list" => unsafe {
+                let script_ptr = core::ptr::addr_of!(SCRIPT_BUFFER);
+                if let Some(ref buf) = *script_ptr {
+                    let _ = serial.write(b"\r\n--- BUFFER CONTENTS ---\r\n");
+                    // We split by lines to ensure we can inject \r for the terminal
+                    for line in buf.lines() {
+                        let _ = serial.write(line.as_bytes());
+                        let _ = serial.write(b"\r\n");
+                    }
+                    let _ = serial.write(b"-----------------------\r\n");
+                } else {
+                    let _ = serial.write(b"Buffer is empty.\r\n");
+                }
+            }
+            "run" => unsafe {
+                let script_ptr = core::ptr::addr_of!(SCRIPT_BUFFER);
+                if let Some(ref code) = *script_ptr {
+                    
+                } else {
+                    let _ = serial.write(b"Buffer empty. Use 'edit' first.\r\n");
+                }
+            }
             _ => {
                 let _ = serial.write(b"Unknown command: ");
                 let _ = serial.write(cmd.as_bytes());
@@ -179,3 +344,4 @@ fn handle_command(serial: &mut SerialPort<hal::usb::UsbBus>, line: &str) {
         }
     }
 }
+
