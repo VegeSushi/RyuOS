@@ -57,48 +57,63 @@ fn main() -> ! {
     let mut input_pos = 0usize;
 
     loop {
+        // 1. Poll USB
         if usb_dev.poll(&mut [&mut serial]) {
-            let mut read_buf = [0u8; 16];
-            match serial.read(&mut read_buf) {
-                Ok(count) if count > 0 => {
-                    for i in 0..count {
-                        let c = read_buf[i];
-
-                        match c {
-                            // 1. Handle Backspace (ASCII 8) or Delete (ASCII 127)
-                            8 | 127 => {
-                                if input_pos > 0 {
-                                    input_pos -= 1;
-                                    // Visual erase: Backspace, Space, Backspace
-                                    let _ = serial.write(b"\x08 \x08");
-                                }
-                            }
-                            // 2. Handle Newline (Enter)
-                            b'\r' | b'\n' => {
-                                let _ = serial.write(b"\r\n");
-                                if input_pos > 0 {
-                                    if let Ok(command_line) = str::from_utf8(&input_buf[..input_pos]) {
-                                        handle_command(&mut serial, command_line);
-                                    }
-                                    input_pos = 0; // Reset buffer
-                                }
-                                let _ = serial.write(b"> "); // New prompt
-                            }
-                            // 3. Handle Regular Characters
-                            _ => {
-                                if input_pos < input_buf.len() {
-                                    input_buf[input_pos] = c;
-                                    input_pos += 1;
-                                    let _ = serial.write(&[c]); // Echo character
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            // 2. Try to read a full line
+            if let Some(command_line) = read_serial_line(&mut serial, &mut input_buf, &mut input_pos) {
+                // 3. If a line was completed, execute it
+                handle_command(&mut serial, command_line);
+                let _ = serial.write(b"> "); 
             }
         }
     }
+}
+
+fn read_serial_line<'a>(
+    serial: &mut SerialPort<hal::usb::UsbBus>,
+    buf: &'a mut [u8],
+    pos: &mut usize,
+) -> Option<&'a str> {
+    let mut read_buf = [0u8; 16];
+
+    match serial.read(&mut read_buf) {
+        Ok(count) if count > 0 => {
+            for i in 0..count {
+                let c = read_buf[i];
+                match c {
+                    // Backspace / Delete
+                    8 | 127 => {
+                        if *pos > 0 {
+                            *pos -= 1;
+                            let _ = serial.write(b"\x08 \x08");
+                        }
+                    }
+                    // Newline
+                    b'\r' | b'\n' => {
+                        let _ = serial.write(b"\r\n");
+                        if *pos > 0 {
+                            let line = str::from_utf8(&buf[..*pos]).ok();
+                            *pos = 0; // Reset for next time
+                            return line;
+                        } else {
+                            // If empty enter, just show prompt again
+                            let _ = serial.write(b"> ");
+                        }
+                    }
+                    // Normal chars
+                    _ => {
+                        if *pos < buf.len() {
+                            buf[*pos] = c;
+                            *pos += 1;
+                            let _ = serial.write(&[c]);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Simple command parser that splits by whitespace
