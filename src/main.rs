@@ -7,7 +7,7 @@ use hal::pac;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 use core::str;
-use rp2040_hal::rom_data;
+use hal::rom_data;
 
 #[link_section = ".boot2"]
 #[used]
