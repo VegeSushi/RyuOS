@@ -139,9 +139,44 @@ unsafe fn handle_editor_input(serial: &mut SerialPort<hal::usb::UsbBus>, c: u8, 
                         IN_EDITOR = false;
                         let _ = serial.write(b"\r\n[ Saved ]\r\n> ");
                     }
+                    b'\t' => { // Tab Support: Insert 4 spaces
+                        for _ in 0..4 {
+                            buf.insert(CURSOR_POS, ' ');
+                            CURSOR_POS += 1;
+                        }
+                        refresh_screen(serial, buf);
+                    }
                     b'\r' | b'\n' => {
+                        // 1. Insert the newline first
                         buf.insert(CURSOR_POS, '\n');
                         CURSOR_POS += 1;
+
+                        // 2. Auto-Indent: Calculate indentation from the previous line
+                        let bytes = buf.as_bytes();
+                        let mut line_start = CURSOR_POS - 1; 
+
+                        // Move back to the start of the line we just finished
+                        // We check bytes[line_start - 1] to find the previous newline
+                        while line_start > 0 && bytes[line_start - 1] != b'\n' {
+                            line_start -= 1;
+                        }
+
+                        // Count leading spaces on that previous line
+                        let mut space_count = 0;
+                        while line_start + space_count < CURSOR_POS - 1 {
+                            if bytes[line_start + space_count] == b' ' {
+                                space_count += 1;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // 3. Apply the indentation to the new line
+                        for _ in 0..space_count {
+                            buf.insert(CURSOR_POS, ' ');
+                            CURSOR_POS += 1;
+                        }
+
                         refresh_screen(serial, buf);
                     }
                     8 | 127 => { // Backspace
@@ -163,18 +198,10 @@ unsafe fn handle_editor_input(serial: &mut SerialPort<hal::usb::UsbBus>, c: u8, 
             1 => { if c == b'[' { *esc_state = 2; } else { *esc_state = 0; } }
             2 => { // ANSI Sequence Handler
                 match c {
-                    b'A' => { // UP
-                        CURSOR_POS = find_vertical_pos(buf, CURSOR_POS, true);
-                    }
-                    b'B' => { // DOWN
-                        CURSOR_POS = find_vertical_pos(buf, CURSOR_POS, false);
-                    }
-                    b'C' => { // RIGHT
-                        if CURSOR_POS < buf.len() { CURSOR_POS += 1; }
-                    }
-                    b'D' => { // LEFT
-                        if CURSOR_POS > 0 { CURSOR_POS -= 1; }
-                    }
+                    b'A' => CURSOR_POS = find_vertical_pos(buf, CURSOR_POS, true),
+                    b'B' => CURSOR_POS = find_vertical_pos(buf, CURSOR_POS, false),
+                    b'C' => if CURSOR_POS < buf.len() { CURSOR_POS += 1; },
+                    b'D' => if CURSOR_POS > 0 { CURSOR_POS -= 1; },
                     _ => {}
                 }
                 *esc_state = 0;
